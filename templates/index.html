@@ -6,20 +6,23 @@
     <meta charset="UTF-8">
     <title>Real-Time Transcription</title>
     <style>
-        body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; background-color: #f0f0f0; }
-        #recordButton { padding: 20px; font-size: 1.2em; cursor: pointer; border: none; border-radius: 50%; width: 100px; height: 100px; background-color: #87CEEB; color: white; transition: background-color 0.3s; }
+        body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; background-color: #f0f0f0; margin: 0; }
+        #recordButton { padding: 20px; font-size: 1.2em; cursor: pointer; border: none; border-radius: 50%; width: 100px; height: 100px; background-color: #87CEEB; color: white; transition: background-color 0.3s; margin-bottom: 20px; }
         #recordButton.recording { background-color: #FF6347; }
-        #status { margin-top: 20px; font-size: 1.1em; color: #333; }
+        #status { font-size: 1.1em; color: #333; height: 30px; }
+        #transcription { margin-top: 20px; width: 80%; max-width: 800px; height: 300px; border: 1px solid #ccc; background-color: white; padding: 10px; overflow-y: scroll; font-size: 1.2em; line-height: 1.5; }
     </style>
 </head>
 <body>
 
     <button id="recordButton">Record</button>
     <div id="status">Status: Not Connected</div>
+    <div id="transcription"></div>
 
     <script>
         const recordButton = document.getElementById('recordButton');
         const statusDiv = document.getElementById('status');
+        const transcriptionDiv = document.getElementById('transcription');
 
         let mediaRecorder;
         let webSocket;
@@ -28,11 +31,7 @@
         recordButton.addEventListener('click', async () => {
             if (!isRecording) {
                 try {
-                    // 1. Get access to the microphone
                     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
-                    // 2. Create the WebSocket connection
-                    // Use wss:// for secure connections (HTTPS)
                     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
                     webSocket = new WebSocket(`${protocol}//${window.location.host}/ws`);
 
@@ -41,59 +40,47 @@
                         recordButton.textContent = 'Stop';
                         recordButton.classList.add('recording');
                         isRecording = true;
+                        transcriptionDiv.innerHTML = '';
 
-                        // 3. Create MediaRecorder and start sending data
-                        mediaRecorder = new MediaRecorder(stream, {
-                            mimeType: 'audio/webm; codecs=opus',
-                            audioBitsPerSecond: 128000 // Standard quality
-                        });
-
-                        // When data is available, send it to the WebSocket
+                        mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm; codecs=opus' });
                         mediaRecorder.ondataavailable = (event) => {
                             if (event.data.size > 0 && webSocket.readyState === WebSocket.OPEN) {
                                 webSocket.send(event.data);
                             }
                         };
-
-                        // Start recording in small chunks. 250ms is a good balance.
                         mediaRecorder.start(250);
                     };
 
-                    webSocket.onclose = () => {
-                        console.log('WebSocket connection closed.');
-                        stopRecording();
+                    // *** NEW: Handle incoming text from the server ***
+                    webSocket.onmessage = (event) => {
+                        const message = event.data;
+                        transcriptionDiv.innerHTML += message + ' ';
+                        transcriptionDiv.scrollTop = transcriptionDiv.scrollHeight; // Auto-scroll
                     };
 
+                    webSocket.onclose = () => { stopRecording(); };
                     webSocket.onerror = (error) => {
                         console.error('WebSocket Error:', error);
-                        statusDiv.textContent = 'Status: Error connecting.';
                         stopRecording();
                     };
 
                 } catch (error) {
                     console.error('Error accessing microphone:', error);
-                    statusDiv.textContent = 'Status: Could not access microphone.';
                 }
             } else {
-                // If we are already recording, this click should stop it.
                 stopRecording();
             }
         });
 
         function stopRecording() {
-            if (mediaRecorder && mediaRecorder.state === 'recording') {
-                mediaRecorder.stop();
-            }
-            if (webSocket && webSocket.readyState === WebSocket.OPEN) {
-                webSocket.close();
-            }
+            if (mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop();
+            if (webSocket && webSocket.readyState === WebSocket.OPEN) webSocket.close();
 
             recordButton.textContent = 'Record';
             recordButton.classList.remove('recording');
             statusDiv.textContent = 'Status: Not Connected';
             isRecording = false;
         }
-
     </script>
 </body>
 </html>
