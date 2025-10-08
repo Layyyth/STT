@@ -26,11 +26,10 @@ logging.info(f"Loading Whisper model: {MODEL_SIZE}")
 model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
 logging.info("Whisper model loaded successfully.")
 
-# vad settings
 SAMPLING_RATE = 16000
 FRAME_DURATION_MS = 30
 FRAME_SIZE_BYTES = (SAMPLING_RATE * FRAME_DURATION_MS // 1000) * 2
-VAD_AGGRESSIVENESS = 3
+CHUNK_DURATION_SECONDS = 5
 
 
 async def transcribe_and_send(audio_bytes: bytes, websocket: WebSocket):
@@ -41,12 +40,15 @@ async def transcribe_and_send(audio_bytes: bytes, websocket: WebSocket):
         segments, _ = model.transcribe(audio_np, beam_size=5)
         transcribed_text = " ".join(segment.text for segment in segments)
         logging.info(f"Transcription result: '{transcribed_text}'")
-        await websocket.send_text(transcribed_text)
+        if transcribed_text.strip():
+            await websocket.send_text(transcribed_text)
     except Exception as e:
         logging.error(f"Error during transcription: {e}")
 
 
 async def audio_processing_pipeline(websocket: WebSocket):
+    audio_queue = asyncio.Queue()
+
     ffmpeg_command = [
         "ffmpeg", "-i", "-", "-f", "s16le", "-ar", str(SAMPLING_RATE), "-ac", "1", "-"
     ]
@@ -61,61 +63,57 @@ async def audio_processing_pipeline(websocket: WebSocket):
             while True:
                 try:
                     audio_chunk = await ws.receive_bytes()
-                    if process.stdin.is_closing(): break
+                    if process.stdin.is_closing():
+                        break
                     process.stdin.write(audio_chunk)
                     await process.stdin.drain()
                 except WebSocketDisconnect:
                     break
-            if not process.stdin.is_closing(): process.stdin.close()
+            if not process.stdin.is_closing():
+                process.stdin.close()
 
-        async def process_vad(ws: WebSocket):
-            vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
-            speech_buffer = bytearray()
-            triggered = False
-            silence_frame_threshold = 15
-            silence_counter = 0
-
+        async def read_ffmpeg_output():
             while True:
                 pcm_chunk = await process.stdout.read(FRAME_SIZE_BYTES)
-                if not pcm_chunk: break
-                if len(pcm_chunk) != FRAME_SIZE_BYTES: continue
+                if not pcm_chunk:
+                    break
+                await audio_queue.put(pcm_chunk)
+            await audio_queue.put(None)
 
-                is_speech = vad.is_speech(pcm_chunk, SAMPLING_RATE)
+        async def process_transcription(ws: WebSocket):
+            speech_buffer = bytearray()
+            buffer_size_limit = int(SAMPLING_RATE * 2 * CHUNK_DURATION_SECONDS)
 
-                if is_speech:
-                    silence_counter = 0
-                    if not triggered:
-                        logging.info("Speech Detected, starting to buffer")
-                        triggered = True
-                    speech_buffer.extend(pcm_chunk)
-                else:
-                    if triggered:
-                        silence_counter += 1
-                        if silence_counter > silence_frame_threshold:
-                            logging.info(f"End of utterance detected after {silence_counter} silent frames.")
-                            if len(speech_buffer) > 0:
-                                asyncio.create_task(transcribe_and_send(bytes(speech_buffer), ws))
+            while True:
+                pcm_chunk = await audio_queue.get()
+                if pcm_chunk is None:
+                    break
 
-                            speech_buffer.clear()
-                            triggered = False
-                            silence_counter = 0
+                speech_buffer.extend(pcm_chunk)
 
-            if triggered and speech_buffer:
-                logging.info("Stream ended, transcribing remaining buffer.")
+                if len(speech_buffer) >= buffer_size_limit:
+                    asyncio.create_task(transcribe_and_send(bytes(speech_buffer), ws))
+                    speech_buffer.clear()
+
+            if speech_buffer:
                 asyncio.create_task(transcribe_and_send(bytes(speech_buffer), ws))
 
         task1 = asyncio.create_task(feed_ffmpeg(websocket))
-        task2 = asyncio.create_task(process_vad(websocket))
-        await asyncio.gather(task1, task2)
+        task2 = asyncio.create_task(read_ffmpeg_output())
+        task3 = asyncio.create_task(process_transcription(websocket))
+
+        await asyncio.gather(task1, task2, task3)
 
     except Exception as e:
         logging.error(f"Error during audio processing: {e}")
     finally:
         logging.info("Audio processing finished. Cleaning up FFmpeg.")
-        if process.returncode is None: process.terminate()
+        if process.returncode is None:
+            process.terminate()
         await process.wait()
         stderr_output = await process.stderr.read()
-        if stderr_output: logging.error(f"FFmpeg stderr: {stderr_output.decode()}")
+        if stderr_output:
+            logging.error(f"FFmpeg stderr: {stderr_output.decode()}")
 
 
 @app.get("/")
